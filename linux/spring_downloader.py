@@ -1,11 +1,17 @@
 import re
 from subprocess import Popen, PIPE, STDOUT
+import sys
 import os
+import platform
+import stat
+import shutil
+import tempfile
 import logging
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from spring_platform import SpringPlatform
+import auto_update
 
 class SpringDownloader(QObject):
     downloadStarted = pyqtSignal(str, str, name='downloadStarted')
@@ -90,3 +96,101 @@ class SpringDownloader(QObject):
         self._MaybeMakeFolder()
         self.downloadStarted.emit(name, "Map")
         self._Download([SpringPlatform.PR_DOWNLOADER_PATH, '--filesystem-writepath', self.FOLDER, '--download-map', name])
+
+    def __mkdtemp(self):
+        i = 0
+        parent_dir = os.path.dirname(os.getcwd())
+        while True:
+            tmp_dir = os.path.join(parent_dir, "tmp_{}".format(i))
+            if not os.path.exists(tmp_dir):
+                try:
+                    os.makedirs(tmp_dir)
+                    return tmp_dir
+                except OSError as e:
+                    import traceback
+                    logging.error(traceback.format_exc())
+                    import sys
+                    sys.exit(-1)
+            else:
+                i = i + 1
+
+    def SelfUpdate(self, launcher_game_id):
+        # determine if application is a script file or frozen exe
+        if not getattr(sys, 'frozen', False):
+            logging.info("Self-update only done for frozen apps.")
+            self.downloadFinished.emit()
+            return
+
+        update_list, existing_list = auto_update.get_update_list(launcher_game_id)
+
+        if len(update_list) == 0:
+            logging.info("No-self update necessary.")
+            return
+
+        logging.info("Copying existing files...")
+
+        TMP_DIR = self.__mkdtemp()
+
+        for existing in existing_list.values():
+            logging.info("Copying: {}".format(existing["path"]))
+            dest_path = os.path.join(TMP_DIR, existing["path"])
+            dest_dir  = os.path.dirname(dest_path)
+            if not os.path.exists(dest_dir):
+                os.makedirs(dest_dir)
+            shutil.copy2(existing["path"], dest_path)
+
+        logging.info("Update list: ")
+        for i, update in enumerate(update_list):
+            update["path"] = os.path.join(TMP_DIR, update["path"])
+            logging.info("{}. {} : {:.1f}kB".format(i, update["path"], update["size"] / 1024))
+
+        self.dl_so_far = 0
+        self.dl_total = sum([up["size"] for up in update_list])
+
+        def callback(chunk_size):
+            self.dl_so_far += chunk_size
+            self.downloadProgress.emit(self.dl_so_far, self.dl_total)
+
+        logging.info("Starting self-update...")
+        self.downloadStarted.emit("Updating: ", "self")
+        auto_update.download_files(update_list, callback)
+        logging.info("Self-update completed - restarting.")
+
+        # TODO: restarting and self-overwriting is a bit more complicated :|
+        # See how other people do it: https://github.com/JMSwag/PyUpdater/blob/4067f9e05f3d1aa7cdec79296824c69cb7510545/pyupdater/client/updates.py
+
+        # sometimes this could be python, but we ignore this
+        # executable = sys.executable
+
+        executable = os.path.join(TMP_DIR, sys.argv[0])
+
+        if platform.system() == "Linux":
+            logging.info("Setting proper file mode: {}".format(executable))
+            os.chmod(executable, stat.S_IREAD | stat.S_IWRITE | stat.S_IEXEC)
+
+        if os.path.exists("data"):
+            shutil.move("data", TMP_DIR)
+
+        curr_path = os.path.abspath(".")
+
+        TMP_DIR2 = self.__mkdtemp()
+        # Move current install
+        shutil.move(curr_path, TMP_DIR2)
+        # Set new install
+        shutil.move(TMP_DIR, curr_path)
+
+        # Preserve old install
+        # shutil.move(TMP_DIR2, os.path.join(curr_path, TMP_DIR))
+
+        # Remove old install
+        shutil.rmtree(TMP_DIR2)
+        executable = sys.executable
+
+        logging.info("Restarting into: {}".format(sys.argv))
+        os.chdir(curr_path)
+
+        os.execl(executable, executable, *sys.argv)
+        # This function stops the application before ever sendnig the downloadFinished signal
+        return
+
+        # self.downloadFinished.emit()
